@@ -37,11 +37,10 @@ public interface IProductoRepository {
     void guardar(Producto producto);
 
     /**
-     * Actualiza el nombre, el precio y el stock de un producto EXISTENTE
-     * (identificado mediante su SKU).
+     * Actualiza el nombre y el precio de un producto EXISTENTE (lo busca por SKU).
+     * NO modifica el stock: para eso usa aumentarStock / descontarStock.
      *
-     * @throws com.tienda.inventario.exception.ProductoNoEncontradoException
-     *         si el SKU no existe.
+     * @throws com.tienda.inventario.exception.ProductoNoEncontradoException si el SKU no existe
      */
     void actualizar(Producto producto);
 
@@ -51,4 +50,21 @@ public interface IProductoRepository {
      * @return true si fue eliminado, false si no existía.
      */
     boolean eliminar(String sku);
+
+    // ---------------- Stock (operaciones atómicas) ----------------
+
+    /**
+     * Suma la cantidad al stock directamente en la BD (stock = stock + cantidad).
+     *
+     * @return true si se actualizó, false si el SKU no existe
+     */
+    boolean aumentarStock(String sku, int cantidad);
+
+    /**
+     * Resta la cantidad del stock solo si alcanza (stock = stock - cantidad).
+     * Es atómica: segura aunque varias ventas ocurran al mismo tiempo.
+     *
+     * @return true si se descontó, false si el SKU no existe o el stock no alcanza
+     */
+    boolean descontarStock(String sku, int cantidad);
 }

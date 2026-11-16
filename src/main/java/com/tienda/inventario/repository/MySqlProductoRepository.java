@@ -66,16 +66,24 @@ public class MySqlProductoRepository implements IProductoRepository {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
-    // Solo se actualiza lo que el modelo permite cambiar:
-    // sku, categoría, tipo, fecha y garantía son final en Java
+    // Solo nombre y precio: el stock cambia ÚNICAMENTE con las operaciones atómicas
+    // (aumentarStock / descontarStock), para no sobrescribirlo con un valor viejo
     private static final String SQL_UPDATE = """
             UPDATE productos
-            SET nombre = ?, precio = ?, stock = ?
+            SET nombre = ?, precio = ?
             WHERE sku = ?
             """;
 
     private static final String SQL_DELETE =
             "DELETE FROM productos WHERE sku = ?";
+
+    // El cálculo lo hace MySQL con el valor actual de la fila, no Java con un valor viejo.
+    // El "AND stock >= ?" impide que el stock quede negativo, en la misma operación.
+    private static final String SQL_DESCONTAR_STOCK =
+            "UPDATE productos SET stock = stock - ? WHERE sku = ? AND stock >= ?";
+
+    private static final String SQL_AUMENTAR_STOCK =
+            "UPDATE productos SET stock = stock + ? WHERE sku = ?";
 
     // ------------------------------------------------------------
     // Códigos de error de MySQL que sabemos interpretar
@@ -164,10 +172,8 @@ public class MySqlProductoRepository implements IProductoRepository {
 
             ps.setString(1, producto.getNombre());
             ps.setBigDecimal(2, producto.getPrecio());
-            ps.setInt(3, producto.getStock());
-            ps.setString(4, producto.getSku());
+            ps.setString(3, producto.getSku());   // antes era el 4: ahora hay un "?" menos
 
-            // executeUpdate devuelve cuántas filas cumplieron el WHERE
             int filas = ps.executeUpdate();
             if (filas == 0) {
                 throw new ProductoNoEncontradoException(producto.getSku());
@@ -189,6 +195,17 @@ public class MySqlProductoRepository implements IProductoRepository {
         } catch (SQLException e) {
             throw new AccesoDatosException("Error al eliminar el producto " + sku, e);
         }
+    }
+
+    @Override
+    public boolean aumentarStock(String sku, int cantidad) {
+        return ejecutarActualizacion(SQL_AUMENTAR_STOCK, cantidad, sku) > 0;
+    }
+
+    @Override
+    public boolean descontarStock(String sku, int cantidad) {
+        // La cantidad va dos veces: una para restar y otra para la condición
+        return ejecutarActualizacion(SQL_DESCONTAR_STOCK, cantidad, sku, cantidad) > 0;
     }
 
     // ============================================================
@@ -219,6 +236,24 @@ public class MySqlProductoRepository implements IProductoRepository {
 
         } catch (SQLException e) {
             throw new AccesoDatosException("Error al consultar los productos", e);
+        }
+    }
+
+    /**
+     * Ejecuta un UPDATE/DELETE con parámetros y devuelve cuántas filas afectó.
+     * Es el equivalente de "consultar", pero para escrituras.
+     */
+    private int ejecutarActualizacion(String sql, Object... parametros) {
+        try (Connection conn = connectionProvider.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            for (int i = 0; i < parametros.length; i++) {
+                ps.setObject(i + 1, parametros[i]);
+            }
+            return ps.executeUpdate();
+
+        } catch (SQLException e) {
+            throw new AccesoDatosException("Error al actualizar el stock", e);
         }
     }
 
