@@ -1,5 +1,7 @@
 package com.tienda.inventario.model;
 
+import com.tienda.inventario.exception.StockInsuficienteException;
+
 import java.math.BigDecimal;
 
 /**
@@ -66,9 +68,7 @@ public abstract class Producto {
             throw new IllegalArgumentException("La cantidad debe ser mayor que 0");
         }
         if (cantidad > stock) {
-            throw new IllegalStateException(
-                    "Stock insuficiente para %s: hay %d, se pidieron %d"
-                            .formatted(sku, stock, cantidad));
+            throw new StockInsuficienteException(sku, stock, cantidad);
         }
         stock -= cantidad;
     }

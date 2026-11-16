@@ -1,5 +1,7 @@
 package com.tienda.inventario;
 
+import com.tienda.inventario.exception.InventarioException;
+import com.tienda.inventario.exception.StockInsuficienteException;
 import com.tienda.inventario.model.Categoria;
 import com.tienda.inventario.model.Producto;
 import com.tienda.inventario.model.ProductoNoPerecedero;
@@ -48,12 +50,21 @@ public class Main {
             System.out.println("Rechazado: " + e.getMessage());
         }
 
-        // 3) Selling more than available
+        // 3) Selling more than available — now with our own exception
         Producto leche = productos.get(0);
         try {
             leche.disminuirStock(100);
-        } catch (IllegalStateException e) {
+        } catch (StockInsuficienteException e) {
             System.out.println("Rechazado: " + e.getMessage());
+            System.out.println("  → Puedes vender máximo: " + e.getDisponible());
+        }
+
+        // 3b) Polymorphism: catching the BASE class also works
+        try {
+            leche.disminuirStock(999);
+        } catch (InventarioException e) {
+            System.out.println("Capturado como " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
         }
 
         // 4) Valid sale
