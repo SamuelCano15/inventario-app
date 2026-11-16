@@ -1,10 +1,11 @@
 package com.tienda.inventario.config;
 
+import com.tienda.inventario.exception.ConfiguracionException;
 import io.github.cdimascio.dotenv.Dotenv;
+import io.github.cdimascio.dotenv.DotenvException;
 
 /**
- * Configuración inmutable de la base de datos,
- * cargada desde el archivo .env.
+ * Configuración inmutable de la base de datos, leída del archivo .env.
  */
 public record AppConfig(
         String host,
@@ -15,45 +16,55 @@ public record AppConfig(
 ) {
 
     /**
-     * Metodo de fábrica: construye la configuración a partir del archivo .env.
-     * Falla inmediatamente si alguna variable obligatoria no está definida.
+     * Construye la configuración a partir del archivo .env.
+     * Falla rápido y con un mensaje claro si falta el archivo o alguna variable.
      */
     public static AppConfig fromEnv() {
-        Dotenv dotenv = Dotenv.load(); // Lanza DotenvException si no se encuentra el archivo .env
+        Dotenv dotenv;
+        try {
+            dotenv = Dotenv.load();
+        } catch (DotenvException e) {
+            // Se traduce el error de la librería a uno propio y entendible
+            throw new ConfiguracionException(
+                    "No se encontró el archivo .env en la carpeta del proyecto. "
+                            + "Copia .env.example como .env y completa tus datos.", e);
+        }
 
         return new AppConfig(
-                required(dotenv, "DB_HOST"),
-                Integer.parseInt(required(dotenv, "DB_PORT")),
-                required(dotenv, "DB_NAME"),
-                required(dotenv, "DB_USER"),
-                required(dotenv, "DB_PASSWORD")
+                requerida(dotenv, "DB_HOST"),
+                leerPuerto(dotenv),
+                requerida(dotenv, "DB_NAME"),
+                requerida(dotenv, "DB_USER"),
+                requerida(dotenv, "DB_PASSWORD")
         );
     }
 
-    /**
-     * Obtiene una variable del archivo .env y comprueba que tenga un valor.
-     * Lanza una excepción si la variable no existe o está vacía.
-     */
-    private static String required(Dotenv dotenv, String key) {
-        String value = dotenv.get(key);
-        if (value == null || value.isBlank()) {
-            throw new IllegalStateException("Missing required variable in .env: " + key);
+    private static String requerida(Dotenv dotenv, String clave) {
+        String valor = dotenv.get(clave);
+        if (valor == null || valor.isBlank()) {
+            throw new ConfiguracionException(
+                    "Falta la variable " + clave + " en el archivo .env (revisa .env.example)");
         }
-        return value;
+        return valor;
     }
 
-    /**
-     * Construye y devuelve la URL de conexión JDBC para MySQL.
-     * Utiliza el servidor, puerto y nombre de la base de datos configurados.
-     */
+    private static int leerPuerto(Dotenv dotenv) {
+        String valor = requerida(dotenv, "DB_PORT");
+        try {
+            return Integer.parseInt(valor);
+        } catch (NumberFormatException e) {
+            throw new ConfiguracionException(
+                    "DB_PORT debe ser un número (ej. 3306), pero vale: " + valor, e);
+        }
+    }
+
     public String jdbcUrl() {
         return "jdbc:mysql://%s:%d/%s?serverTimezone=America/Bogota"
                 .formatted(host, port, dbName);
     }
 
     /**
-     * Se sobrescribe para evitar que la contraseña aparezca en los registros
-     * o en la salida de la consola.
+     * Se sobrescribe para que la contraseña nunca aparezca en la consola ni en los logs.
      */
     @Override
     public String toString() {
