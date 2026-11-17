@@ -8,8 +8,9 @@
 --                      productos, historial_precios
 --   2. Seguridad     → roles, permisos, rol_permisos, usuarios
 --   3. Terceros      → proveedores, producto_proveedor, clientes, abonos_clientes (fiado)
---   4. Compras       → compras, compra_detalles
---   5. Inventario    → lotes, movimientos_inventario (kardex)
+--   4. Compras       → compras, compra_detalles, pagos_proveedores
+--   5. Inventario    → lotes, conteos_inventario, conteo_detalles,
+--                      movimientos_inventario (kardex)
 --   6. Ventas        → ventas, venta_detalles, venta_pagos
 --   7. Utilidades    → consecutivos, vistas
 -- =====================================================================
@@ -240,40 +241,75 @@ CREATE TABLE abonos_clientes (
 ) ENGINE = InnoDB;
 
 -- =====================================================================
--- 4. COMPRAS (entradas de mercancía)
+-- 4. COMPRAS (pedidos y entradas de mercancía)
 -- =====================================================================
 
+-- Ciclo de vida: BORRADOR (pedido hecho) → RECIBIDA (llegó, se crean lotes) → ANULADA.
+-- Los lotes y movimientos SOLO se crean al pasar a RECIBIDA.
+-- Los costos de compra se guardan SIN IVA (así vienen en la factura del proveedor).
 CREATE TABLE compras (
-    id               INT AUTO_INCREMENT PRIMARY KEY,
-    proveedor_id     INT           NOT NULL,
-    numero_factura   VARCHAR(30)   NOT NULL,   -- la factura del proveedor
-    fecha_compra     DATE          NOT NULL,
-    usuario_id       INT           NOT NULL,   -- quién la recibió
-    estado           ENUM('BORRADOR','RECIBIDA','ANULADA') NOT NULL DEFAULT 'BORRADOR',
-    subtotal         DECIMAL(14,2) NOT NULL DEFAULT 0,
-    total_impuestos  DECIMAL(14,2) NOT NULL DEFAULT 0,
-    total            DECIMAL(14,2) NOT NULL DEFAULT 0,
-    notas            VARCHAR(255)  NULL,
-    creado_en        DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    id                 INT AUTO_INCREMENT PRIMARY KEY,
+    proveedor_id       INT           NOT NULL,
+    numero_factura     VARCHAR(30)   NULL,       -- la del proveedor; no existe mientras es pedido
+    fecha_pedido       DATE          NOT NULL,
+    fecha_recepcion    DATETIME      NULL,       -- cuándo llegó la mercancía
+    creado_por         INT           NOT NULL,   -- quién hizo el pedido
+    recibido_por       INT           NULL,       -- quién recibió la mercancía
+    estado             ENUM('BORRADOR','RECIBIDA','ANULADA') NOT NULL DEFAULT 'BORRADOR',
+    forma_pago         ENUM('CONTADO','CREDITO') NOT NULL DEFAULT 'CONTADO',
+    fecha_limite_pago  DATE          NULL,       -- solo si es a crédito ("a 30 días")
+    subtotal           DECIMAL(14,2) NOT NULL DEFAULT 0,
+    total_impuestos    DECIMAL(14,2) NOT NULL DEFAULT 0,
+    total              DECIMAL(14,2) NOT NULL DEFAULT 0,
+    notas              VARCHAR(255)  NULL,
+    creado_en          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_compra_factura UNIQUE (proveedor_id, numero_factura),  -- no registrar dos veces la misma
     CONSTRAINT fk_compra_proveedor FOREIGN KEY (proveedor_id) REFERENCES proveedores (id),
-    CONSTRAINT fk_compra_usuario   FOREIGN KEY (usuario_id)   REFERENCES usuarios (id),
+    CONSTRAINT fk_compra_creador   FOREIGN KEY (creado_por)   REFERENCES usuarios (id),
+    CONSTRAINT fk_compra_receptor  FOREIGN KEY (recibido_por) REFERENCES usuarios (id),
     CONSTRAINT chk_compra_totales  CHECK (subtotal >= 0 AND total_impuestos >= 0
-                                          AND total = subtotal + total_impuestos)
+                                          AND total = subtotal + total_impuestos),
+    -- crédito ⇔ tiene fecha límite de pago
+    CONSTRAINT chk_compra_credito  CHECK ((forma_pago = 'CREDITO') = (fecha_limite_pago IS NOT NULL)),
+    -- un pedido aún no tiene recepción; una compra recibida sí, con factura y receptor
+    CONSTRAINT chk_compra_estado   CHECK (
+        (estado = 'BORRADOR' AND fecha_recepcion IS NULL AND recibido_por IS NULL)
+     OR (estado = 'RECIBIDA' AND fecha_recepcion IS NOT NULL AND recibido_por IS NOT NULL
+                             AND numero_factura IS NOT NULL)
+     OR (estado = 'ANULADA')
+    )
 ) ENGINE = InnoDB;
 
--- Cada línea de compra genera exactamente un lote.
+-- Se pide una cantidad y puede llegar otra ("pedí 20, llegaron 18").
 CREATE TABLE compra_detalles (
-    id                   INT AUTO_INCREMENT PRIMARY KEY,
-    compra_id            INT           NOT NULL,
-    producto_id          INT           NOT NULL,
-    cantidad             INT           NOT NULL,
-    costo_unitario       DECIMAL(12,2) NOT NULL,   -- sin IVA
-    porcentaje_impuesto  DECIMAL(5,2)  NOT NULL,   -- copia del momento (snapshot)
+    id                      INT AUTO_INCREMENT PRIMARY KEY,
+    compra_id               INT           NOT NULL,
+    producto_id             INT           NOT NULL,
+    cantidad_pedida         INT           NOT NULL,
+    cantidad_recibida       INT           NULL,      -- NULL mientras no llega
+    costo_unitario_sin_iva  DECIMAL(12,2) NOT NULL,
+    porcentaje_impuesto     DECIMAL(5,2)  NOT NULL,  -- copia del momento (snapshot)
     CONSTRAINT fk_cd_compra   FOREIGN KEY (compra_id)   REFERENCES compras (id) ON DELETE CASCADE,
     CONSTRAINT fk_cd_producto FOREIGN KEY (producto_id) REFERENCES productos (id),
-    CONSTRAINT chk_cd_cantidad CHECK (cantidad > 0),
-    CONSTRAINT chk_cd_costo    CHECK (costo_unitario >= 0)
+    CONSTRAINT chk_cd_pedida   CHECK (cantidad_pedida > 0),
+    CONSTRAINT chk_cd_recibida CHECK (cantidad_recibida IS NULL OR cantidad_recibida >= 0),
+    CONSTRAINT chk_cd_costo    CHECK (costo_unitario_sin_iva >= 0)
+) ENGINE = InnoDB;
+
+-- Pagos a proveedores. Lo que se debe NO se guarda: total − pagos (ver v_cuentas_por_pagar).
+-- Una compra de CONTADO también registra aquí su pago, para que la caja cuadre.
+CREATE TABLE pagos_proveedores (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    compra_id   INT           NOT NULL,
+    monto       DECIMAL(14,2) NOT NULL,
+    metodo      ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
+                     'TRANSFERENCIA','NEQUI','DAVIPLATA') NOT NULL,
+    referencia  VARCHAR(60)   NULL,              -- número de la transferencia, etc.
+    usuario_id  INT           NOT NULL,
+    pagado_en   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_pp_compra  FOREIGN KEY (compra_id)  REFERENCES compras (id),
+    CONSTRAINT fk_pp_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
+    CONSTRAINT chk_pp_monto CHECK (monto > 0)
 ) ENGINE = InnoDB;
 
 -- =====================================================================
@@ -281,53 +317,106 @@ CREATE TABLE compra_detalles (
 -- =====================================================================
 
 -- Aquí vive el vencimiento: la leche del 30-dic y la del 5-ene son dos lotes.
+-- Una línea de compra puede generar VARIOS lotes (llegan 20 leches: 10 vencen
+-- el 30-dic y 10 el 5-ene). El servicio valida que sumen cantidad_recibida.
 -- cantidad_actual es un valor DERIVADO de los movimientos (caché a propósito):
 -- permite el descuento atómico y la consulta FEFO sin sumar el kardex completo.
+-- Cada lote guarda SU costo: así se sabe la ganancia exacta de cada venta.
 CREATE TABLE lotes (
-    id                 INT AUTO_INCREMENT PRIMARY KEY,
-    producto_id        INT           NOT NULL,
-    compra_detalle_id  INT           NULL,      -- NULL si el lote nace de un ajuste
-    codigo_lote        VARCHAR(40)   NULL,      -- el que trae impreso el empaque
-    fecha_vencimiento  DATE          NULL,      -- obligatoria si el producto maneja vencimiento (lo valida el servicio)
-    cantidad_inicial   INT           NOT NULL,
-    cantidad_actual    INT           NOT NULL,
-    costo_unitario     DECIMAL(12,2) NOT NULL,
-    ingresado_en       DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_lote_compra_detalle UNIQUE (compra_detalle_id),
+    id                      INT AUTO_INCREMENT PRIMARY KEY,
+    producto_id             INT           NOT NULL,
+    compra_detalle_id       INT           NULL,  -- NULL si el lote nace de un ajuste o de la migración
+    codigo_lote             VARCHAR(40)   NULL,  -- el que trae impreso el empaque
+    fecha_vencimiento       DATE          NULL,  -- obligatoria si el producto maneja vencimiento (lo valida el servicio)
+    cantidad_inicial        INT           NOT NULL,
+    cantidad_actual         INT           NOT NULL,
+    costo_unitario_sin_iva  DECIMAL(12,2) NOT NULL,
+    ingresado_en            DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_lote_producto       FOREIGN KEY (producto_id)       REFERENCES productos (id),
     CONSTRAINT fk_lote_compra_detalle FOREIGN KEY (compra_detalle_id) REFERENCES compra_detalles (id),
     CONSTRAINT chk_lote_inicial CHECK (cantidad_inicial > 0),
     CONSTRAINT chk_lote_actual  CHECK (cantidad_actual >= 0),
-    CONSTRAINT chk_lote_costo   CHECK (costo_unitario >= 0),
+    CONSTRAINT chk_lote_costo   CHECK (costo_unitario_sin_iva >= 0),
     INDEX idx_lote_fefo (producto_id, fecha_vencimiento)   -- sirve a la consulta FEFO
 ) ENGINE = InnoDB;
 
--- Kardex: registro INMUTABLE de todo lo que entra y sale (solo INSERT, nunca UPDATE).
+-- Conteo físico: se cuenta la estantería y se compara con el sistema.
+-- Al CERRAR el conteo, el servicio genera los AJUSTE_* que correspondan.
+CREATE TABLE conteos_inventario (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    estado       ENUM('ABIERTO','CERRADO','CANCELADO') NOT NULL DEFAULT 'ABIERTO',
+    usuario_id   INT          NOT NULL,          -- responsable del conteo
+    iniciado_en  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    cerrado_en   DATETIME     NULL,
+    notas        VARCHAR(255) NULL,
+    CONSTRAINT fk_conteo_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
+    CONSTRAINT chk_conteo_estado CHECK (
+        (estado = 'ABIERTO' AND cerrado_en IS NULL) OR (estado <> 'ABIERTO' AND cerrado_en IS NOT NULL)
+    )
+) ENGINE = InnoDB;
+
+-- Se cuenta por producto (en la estantería no se distinguen los lotes de algo sin fecha).
+-- cantidad_sistema es una foto del stock en el momento de contar.
+CREATE TABLE conteo_detalles (
+    conteo_id         INT NOT NULL,
+    producto_id       INT NOT NULL,
+    cantidad_sistema  INT NOT NULL,
+    cantidad_contada  INT NOT NULL,
+    diferencia        INT GENERATED ALWAYS AS (cantidad_contada - cantidad_sistema) STORED,
+    PRIMARY KEY (conteo_id, producto_id),
+    CONSTRAINT fk_cdet_conteo   FOREIGN KEY (conteo_id)   REFERENCES conteos_inventario (id) ON DELETE CASCADE,
+    CONSTRAINT fk_cdet_producto FOREIGN KEY (producto_id) REFERENCES productos (id),
+    CONSTRAINT chk_cdet_cantidades CHECK (cantidad_sistema >= 0 AND cantidad_contada >= 0)
+) ENGINE = InnoDB;
+
+-- Kardex: registro INMUTABLE de todo lo que entra y sale (solo INSERT; nunca UPDATE ni DELETE).
 -- La cantidad siempre es positiva; el sentido lo da el tipo.
+-- Un error NO se borra: se registra un ajuste contrario que apunta al movimiento
+-- equivocado con corrige_movimiento_id (como un banco que reversa una transferencia).
 CREATE TABLE movimientos_inventario (
-    id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
-    lote_id            INT          NOT NULL,
-    tipo               ENUM('ENTRADA_COMPRA','AJUSTE_ENTRADA','DEVOLUCION_CLIENTE',
-                            'SALIDA_VENTA','AJUSTE_SALIDA','BAJA_VENCIMIENTO',
-                            'DEVOLUCION_PROVEEDOR') NOT NULL,
-    cantidad           INT          NOT NULL,
-    compra_detalle_id  INT          NULL,
-    venta_detalle_id   INT          NULL,
-    usuario_id         INT          NOT NULL,
-    motivo             VARCHAR(255) NULL,
-    creado_en          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_mov_lote    FOREIGN KEY (lote_id)           REFERENCES lotes (id),
-    CONSTRAINT fk_mov_compra  FOREIGN KEY (compra_detalle_id) REFERENCES compra_detalles (id),
-    CONSTRAINT fk_mov_usuario FOREIGN KEY (usuario_id)        REFERENCES usuarios (id),
+    id                     BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lote_id                INT          NOT NULL,
+    tipo                   ENUM(
+                               -- entradas (+)
+                               'ENTRADA_COMPRA','AJUSTE_ENTRADA','DEVOLUCION_CLIENTE','ANULACION_VENTA',
+                               -- salidas (−)
+                               'SALIDA_VENTA','AJUSTE_SALIDA','BAJA_VENCIMIENTO','DEVOLUCION_PROVEEDOR'
+                           ) NOT NULL,
+    cantidad               INT          NOT NULL,
+    compra_detalle_id      INT          NULL,
+    venta_detalle_id       INT          NULL,
+    conteo_id              INT          NULL,
+    corrige_movimiento_id  BIGINT       NULL,
+    usuario_id             INT          NOT NULL,
+    motivo                 VARCHAR(255) NULL,
+    creado_en              DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_mov_corrige  UNIQUE (corrige_movimiento_id),     -- un error se corrige una sola vez
+    CONSTRAINT fk_mov_lote     FOREIGN KEY (lote_id)               REFERENCES lotes (id),
+    CONSTRAINT fk_mov_compra   FOREIGN KEY (compra_detalle_id)     REFERENCES compra_detalles (id),
+    CONSTRAINT fk_mov_conteo   FOREIGN KEY (conteo_id)             REFERENCES conteos_inventario (id),
+    CONSTRAINT fk_mov_corrige  FOREIGN KEY (corrige_movimiento_id) REFERENCES movimientos_inventario (id),
+    CONSTRAINT fk_mov_usuario  FOREIGN KEY (usuario_id)            REFERENCES usuarios (id),
     -- fk a venta_detalles se agrega abajo
     CONSTRAINT chk_mov_cantidad CHECK (cantidad > 0),
-    -- cada tipo exige su documento de origen
+    -- cada tipo exige su documento de origen (y solo ese)
     CONSTRAINT chk_mov_referencias CHECK (
-        (tipo = 'ENTRADA_COMPRA' AND compra_detalle_id IS NOT NULL AND venta_detalle_id IS NULL)
-     OR (tipo IN ('SALIDA_VENTA','DEVOLUCION_CLIENTE')
-                                AND venta_detalle_id IS NOT NULL AND compra_detalle_id IS NULL)
-     OR (tipo IN ('AJUSTE_ENTRADA','AJUSTE_SALIDA','BAJA_VENCIMIENTO','DEVOLUCION_PROVEEDOR')
-                                AND motivo IS NOT NULL)
+        (tipo = 'ENTRADA_COMPRA'
+            AND compra_detalle_id IS NOT NULL AND venta_detalle_id IS NULL AND conteo_id IS NULL)
+     OR (tipo = 'DEVOLUCION_PROVEEDOR'
+            AND compra_detalle_id IS NOT NULL AND venta_detalle_id IS NULL AND conteo_id IS NULL
+            AND motivo IS NOT NULL)
+     OR (tipo IN ('SALIDA_VENTA','DEVOLUCION_CLIENTE','ANULACION_VENTA')
+            AND venta_detalle_id IS NOT NULL AND compra_detalle_id IS NULL AND conteo_id IS NULL)
+     OR (tipo IN ('AJUSTE_ENTRADA','AJUSTE_SALIDA')
+            AND compra_detalle_id IS NULL AND venta_detalle_id IS NULL
+            AND (motivo IS NOT NULL OR conteo_id IS NOT NULL))
+     OR (tipo = 'BAJA_VENCIMIENTO'
+            AND compra_detalle_id IS NULL AND venta_detalle_id IS NULL AND motivo IS NOT NULL)
+    ),
+    -- una corrección siempre es un ajuste y siempre explica por qué
+    CONSTRAINT chk_mov_correccion CHECK (
+        corrige_movimiento_id IS NULL
+     OR (tipo IN ('AJUSTE_ENTRADA','AJUSTE_SALIDA') AND motivo IS NOT NULL)
     ),
     INDEX idx_mov_lote_fecha (lote_id, creado_en)
 ) ENGINE = InnoDB;
@@ -428,7 +517,7 @@ SELECT m.id,
        p.sku,
        m.lote_id,
        m.tipo,
-       CASE WHEN m.tipo IN ('ENTRADA_COMPRA','AJUSTE_ENTRADA','DEVOLUCION_CLIENTE')
+       CASE WHEN m.tipo IN ('ENTRADA_COMPRA','AJUSTE_ENTRADA','DEVOLUCION_CLIENTE','ANULACION_VENTA')
             THEN m.cantidad ELSE -m.cantidad END AS cantidad_con_signo,
        u.username,
        m.motivo
@@ -462,9 +551,44 @@ JOIN rol_permisos rp ON rp.rol_id = r.id
 JOIN permisos p      ON p.id = rp.permiso_id
 WHERE u.activo;
 
+-- Lo que se le debe a cada proveedor, factura por factura.
+CREATE VIEW v_cuentas_por_pagar AS
+SELECT c.id AS compra_id,
+       pr.razon_social AS proveedor,
+       c.numero_factura,
+       c.forma_pago,
+       c.fecha_limite_pago,
+       c.total,
+       COALESCE(SUM(pp.monto), 0)           AS pagado,
+       c.total - COALESCE(SUM(pp.monto), 0) AS saldo,
+       CASE WHEN c.fecha_limite_pago < CURRENT_DATE THEN 'VENCIDA' ELSE 'AL_DIA' END AS situacion
+FROM compras c
+JOIN proveedores pr ON pr.id = c.proveedor_id
+LEFT JOIN pagos_proveedores pp ON pp.compra_id = c.id
+WHERE c.estado = 'RECIBIDA'
+GROUP BY c.id, pr.razon_social, c.numero_factura, c.forma_pago, c.fecha_limite_pago, c.total
+HAVING saldo > 0;
+
+-- Mermas: cuánto se pierde por producto (vencidos y faltantes), en unidades y al costo.
+-- Se excluyen los movimientos que fueron reversados (los que alguien corrigió).
+CREATE VIEW v_mermas AS
+SELECT p.sku,
+       p.nombre,
+       SUM(CASE WHEN m.tipo = 'BAJA_VENCIMIENTO' THEN m.cantidad ELSE 0 END) AS unidades_vencidas,
+       SUM(CASE WHEN m.tipo = 'AJUSTE_SALIDA'    THEN m.cantidad ELSE 0 END) AS unidades_faltantes,
+       SUM(m.cantidad * l.costo_unitario_sin_iva)                           AS costo_perdido
+FROM movimientos_inventario m
+JOIN lotes l     ON l.id = m.lote_id
+JOIN productos p ON p.id = l.producto_id
+LEFT JOIN movimientos_inventario reversa ON reversa.corrige_movimiento_id = m.id
+WHERE m.tipo IN ('BAJA_VENCIMIENTO', 'AJUSTE_SALIDA')
+  AND m.corrige_movimiento_id IS NULL     -- no es una reversa
+  AND reversa.id IS NULL                  -- y nadie lo reversó
+GROUP BY p.sku, p.nombre;
+
 -- Valor del inventario al costo (lo que costó) y al precio de venta (lo que vale).
 CREATE VIEW v_valor_inventario AS
-SELECT SUM(l.cantidad_actual * l.costo_unitario) AS valor_al_costo,
+SELECT SUM(l.cantidad_actual * l.costo_unitario_sin_iva) AS valor_al_costo,
        SUM(l.cantidad_actual * p.precio_venta_iva_incluido) AS valor_a_precio_venta
 FROM lotes l
 JOIN productos p ON p.id = l.producto_id
