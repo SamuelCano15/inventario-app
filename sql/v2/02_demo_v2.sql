@@ -37,13 +37,13 @@ UPDATE consecutivos SET ultimo = LAST_INSERT_ID(ultimo + 1) WHERE clave = 'SKU-L
 SET @sku_leche = CONCAT('LAC-', LPAD(LAST_INSERT_ID(), 4, '0'));   -- LAC-0001
 
 INSERT INTO productos (sku, codigo_barras, nombre, categoria_id, marca_id, unidad_id,
-                       contenido, impuesto_id, precio_venta, stock_minimo, maneja_vencimiento)
+                       contenido, impuesto_id, precio_venta_iva_incluido, stock_minimo, maneja_vencimiento)
 VALUES (@sku_leche, '7702129001014', 'Leche entera Colanta 1 L', 5, 1, 5, 1, 1, 4500.00, 10, TRUE);
 SET @id_leche = LAST_INSERT_ID();
 
 UPDATE consecutivos SET ultimo = LAST_INSERT_ID(ultimo + 1) WHERE clave = 'SKU-ELE';
 INSERT INTO productos (sku, nombre, categoria_id, marca_id, unidad_id, contenido,
-                       impuesto_id, precio_venta, maneja_vencimiento, meses_garantia)
+                       impuesto_id, precio_venta_iva_incluido, maneja_vencimiento, meses_garantia)
 VALUES (CONCAT('ELE-', LPAD(LAST_INSERT_ID(), 4, '0')), 'Audífonos Bluetooth', 4, 4, 1, 1,
         3, 85000.00, FALSE, 12);
 

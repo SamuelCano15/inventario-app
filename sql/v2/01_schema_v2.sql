@@ -91,10 +91,11 @@ CREATE TABLE productos (
     unidad_id           INT           NOT NULL,
     contenido           DECIMAL(10,3) NOT NULL,          -- 1.000 (L), 500.000 (g)
     impuesto_id         INT           NOT NULL,
-    precio_venta        DECIMAL(12,2) NOT NULL,          -- precio sin IVA
+    precio_venta_iva_incluido DECIMAL(12,2) NOT NULL,    -- precio de estantería (lo que paga el cliente)
     stock_minimo        INT           NOT NULL DEFAULT 0,
     maneja_vencimiento  BOOLEAN       NOT NULL,          -- reemplaza al ENUM tipo
     meses_garantia      SMALLINT      NULL,
+    imagen_url          VARCHAR(500)  NULL,              -- ruta o URL de la imagen; nunca la imagen en la BD
     activo              BOOLEAN       NOT NULL DEFAULT TRUE,  -- se desactiva, no se borra
     creado_en           DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     actualizado_en      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -105,7 +106,7 @@ CREATE TABLE productos (
     CONSTRAINT fk_producto_marca     FOREIGN KEY (marca_id)     REFERENCES marcas (id),
     CONSTRAINT fk_producto_unidad    FOREIGN KEY (unidad_id)    REFERENCES unidades_medida (id),
     CONSTRAINT fk_producto_impuesto  FOREIGN KEY (impuesto_id)  REFERENCES impuestos (id),
-    CONSTRAINT chk_producto_precio      CHECK (precio_venta >= 0),
+    CONSTRAINT chk_producto_precio      CHECK (precio_venta_iva_incluido >= 0),
     CONSTRAINT chk_producto_contenido   CHECK (contenido > 0),
     CONSTRAINT chk_producto_stock_min   CHECK (stock_minimo >= 0),
     CONSTRAINT chk_producto_garantia    CHECK (meses_garantia IS NULL OR meses_garantia > 0),
@@ -119,8 +120,8 @@ CREATE TABLE productos (
 CREATE TABLE historial_precios (
     id               BIGINT AUTO_INCREMENT PRIMARY KEY,
     producto_id      INT           NOT NULL,
-    precio_anterior  DECIMAL(12,2) NOT NULL,
-    precio_nuevo     DECIMAL(12,2) NOT NULL,
+    precio_anterior  DECIMAL(12,2) NOT NULL,          -- con IVA incluido
+    precio_nuevo     DECIMAL(12,2) NOT NULL,          -- con IVA incluido
     usuario_id       INT           NOT NULL,
     cambiado_en      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_hist_producto FOREIGN KEY (producto_id) REFERENCES productos (id),
@@ -394,7 +395,7 @@ JOIN usuarios  u ON u.id = m.usuario_id;
 -- Valor del inventario al costo (lo que costó) y al precio de venta (lo que vale).
 CREATE VIEW v_valor_inventario AS
 SELECT SUM(l.cantidad_actual * l.costo_unitario) AS valor_al_costo,
-       SUM(l.cantidad_actual * p.precio_venta)   AS valor_a_precio_venta
+       SUM(l.cantidad_actual * p.precio_venta_iva_incluido) AS valor_a_precio_venta
 FROM lotes l
 JOIN productos p ON p.id = l.producto_id
 WHERE l.fecha_vencimiento IS NULL OR l.fecha_vencimiento >= CURRENT_DATE;
