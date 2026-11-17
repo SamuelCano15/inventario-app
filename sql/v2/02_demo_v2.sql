@@ -26,7 +26,35 @@ INSERT INTO categorias (id, nombre, prefijo_sku, categoria_padre_id) VALUES
 INSERT INTO consecutivos (clave, ultimo) VALUES
     ('SKU-LAC', 0), ('SKU-GRA', 0), ('SKU-ASE', 0), ('SKU-ELE', 0), ('FACTURA-VENTA', 0);
 
-INSERT INTO roles (nombre) VALUES ('ADMIN'), ('CAJERO'), ('BODEGA');
+INSERT INTO roles (nombre, descripcion) VALUES
+    ('ADMIN',  'Acceso total'),
+    ('CAJERO', 'Vende y recibe abonos'),
+    ('BODEGA', 'Recibe compras y ajusta inventario');
+
+INSERT INTO permisos (codigo, descripcion) VALUES
+    ('PRODUCTO_CREAR',          'Crear y editar productos'),
+    ('PRODUCTO_CAMBIAR_PRECIO', 'Cambiar el precio de venta'),
+    ('COMPRA_REGISTRAR',        'Registrar compras a proveedores'),
+    ('INVENTARIO_AJUSTAR',      'Hacer ajustes y bajas de inventario'),
+    ('VENTA_REGISTRAR',         'Registrar ventas'),
+    ('VENTA_ANULAR',            'Anular ventas'),
+    ('VENTA_FIAR',              'Vender a crédito (fiado)'),
+    ('ABONO_REGISTRAR',         'Recibir abonos de clientes'),
+    ('USUARIO_ADMINISTRAR',     'Crear usuarios, roles y permisos');
+
+-- ADMIN tiene todos los permisos.
+INSERT INTO rol_permisos (rol_id, permiso_id)
+SELECT r.id, p.id FROM roles r CROSS JOIN permisos p WHERE r.nombre = 'ADMIN';
+
+INSERT INTO rol_permisos (rol_id, permiso_id)
+SELECT r.id, p.id FROM roles r JOIN permisos p
+  ON p.codigo IN ('VENTA_REGISTRAR', 'VENTA_FIAR', 'ABONO_REGISTRAR')
+WHERE r.nombre = 'CAJERO';
+
+INSERT INTO rol_permisos (rol_id, permiso_id)
+SELECT r.id, p.id FROM roles r JOIN permisos p
+  ON p.codigo IN ('COMPRA_REGISTRAR', 'INVENTARIO_AJUSTAR', 'PRODUCTO_CREAR')
+WHERE r.nombre = 'BODEGA';
 -- Hash de ejemplo (no es una clave real). En la app se genera con bcrypt.
 INSERT INTO usuarios (username, password_hash, nombre_completo, rol_id) VALUES
     ('admin',  '$2a$12$EJEMPLO.NO.ES.UNA.CLAVE.REAL.xxxxxxxxxxxxxxxxxxxxxxxx', 'Administrador', 1),
@@ -129,6 +157,31 @@ INSERT INTO venta_pagos (venta_id, metodo, monto) VALUES
     (@venta, 'EFECTIVO', 100000.00), (@venta, 'NEQUI', 12500.00);
 COMMIT;
 
+-- ---------- Venta fiada: doña Marta se lleva 2 leches y paga después ----------
+INSERT INTO clientes (tipo_documento, numero_documento, nombre, telefono, cupo_fiado)
+VALUES ('CC', '43123456', 'Marta Gómez', '3001234567', 50000.00);
+SET @marta = LAST_INSERT_ID();
+SET @lote_ene = (SELECT id FROM lotes WHERE codigo_lote = 'L-05ENE');
+
+START TRANSACTION;
+SELECT id FROM lotes WHERE id = @lote_ene FOR UPDATE;
+UPDATE consecutivos SET ultimo = LAST_INSERT_ID(ultimo + 1) WHERE clave = 'FACTURA-VENTA';
+INSERT INTO ventas (numero_factura, cliente_id, usuario_id, subtotal, total_impuestos, total)
+VALUES (CONCAT('FV-', LPAD(LAST_INSERT_ID(), 6, '0')), @marta, 2, 9000.00, 0, 9000.00);
+SET @venta_fiada = LAST_INSERT_ID();
+INSERT INTO venta_detalles (venta_id, producto_id, cantidad, precio_unitario, porcentaje_impuesto)
+VALUES (@venta_fiada, @id_leche, 2, 4500.00, 0);
+SET @vd2 = LAST_INSERT_ID();
+UPDATE lotes SET cantidad_actual = cantidad_actual - 2 WHERE id = @lote_ene;
+INSERT INTO movimientos_inventario (lote_id, tipo, cantidad, venta_detalle_id, usuario_id)
+VALUES (@lote_ene, 'SALIDA_VENTA', 2, @vd2, 2);
+INSERT INTO venta_pagos (venta_id, metodo, monto) VALUES (@venta_fiada, 'FIADO', 9000.00);
+COMMIT;
+
+-- Al otro día abona 5.000 por Nequi.
+INSERT INTO abonos_clientes (cliente_id, monto, metodo, usuario_id, nota)
+VALUES (@marta, 5000.00, 'NEQUI', 2, 'Abono parcial');
+
 -- ---------- Baja del lote vencido (ajuste con motivo obligatorio) ----------
 SET @lote_viejo = (SELECT id FROM lotes WHERE codigo_lote = 'L-VIEJO');
 START TRANSACTION;
@@ -138,6 +191,9 @@ VALUES (@lote_viejo, 'BAJA_VENCIMIENTO', 5, 1, 'Vencido, se desecha');
 COMMIT;
 
 -- ---------- Resultados ----------
+SELECT * FROM v_saldo_clientes;
+SELECT rol, GROUP_CONCAT(DISTINCT permiso ORDER BY permiso SEPARATOR ', ') AS permisos
+FROM v_permisos_usuario GROUP BY rol;
 SELECT 'Stock después' AS paso, sku, stock_total, stock_vendible FROM v_stock_producto;
 SELECT codigo_lote, fecha_vencimiento, cantidad_inicial, cantidad_actual FROM lotes ORDER BY id;
 SELECT * FROM v_kardex ORDER BY id;

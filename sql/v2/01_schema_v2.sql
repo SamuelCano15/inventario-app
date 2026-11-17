@@ -6,8 +6,8 @@
 -- Módulos:
 --   1. Catálogo      → categorias, marcas, unidades_medida, impuestos,
 --                      productos, historial_precios
---   2. Seguridad     → roles, usuarios
---   3. Terceros      → proveedores, producto_proveedor, clientes
+--   2. Seguridad     → roles, permisos, rol_permisos, usuarios
+--   3. Terceros      → proveedores, producto_proveedor, clientes, abonos_clientes (fiado)
 --   4. Compras       → compras, compra_detalles
 --   5. Inventario    → lotes, movimientos_inventario (kardex)
 --   6. Ventas        → ventas, venta_detalles, venta_pagos
@@ -134,9 +134,30 @@ CREATE TABLE historial_precios (
 -- =====================================================================
 
 CREATE TABLE roles (
-    id      INT AUTO_INCREMENT PRIMARY KEY,
-    nombre  VARCHAR(30) NOT NULL,               -- ADMIN, CAJERO, BODEGA
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    nombre       VARCHAR(30)  NOT NULL,         -- ADMIN, CAJERO, BODEGA
+    descripcion  VARCHAR(150) NULL,
     CONSTRAINT uq_rol_nombre UNIQUE (nombre)
+) ENGINE = InnoDB;
+
+-- Catálogo de acciones que la app sabe proteger. El código Java pregunta
+-- "¿este usuario tiene PRODUCTO_CAMBIAR_PRECIO?", nunca "¿es ADMIN?".
+-- Así, crear un rol nuevo desde la web no exige tocar el código.
+CREATE TABLE permisos (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    codigo       VARCHAR(50)  NOT NULL,         -- 'VENTA_REGISTRAR', 'PRODUCTO_CAMBIAR_PRECIO', ...
+    descripcion  VARCHAR(150) NOT NULL,
+    CONSTRAINT uq_permiso_codigo UNIQUE (codigo),
+    CONSTRAINT chk_permiso_codigo CHECK (codigo = UPPER(codigo))
+) ENGINE = InnoDB;
+
+-- N:M: un rol tiene muchos permisos y un permiso está en muchos roles.
+CREATE TABLE rol_permisos (
+    rol_id      INT NOT NULL,
+    permiso_id  INT NOT NULL,
+    PRIMARY KEY (rol_id, permiso_id),
+    CONSTRAINT fk_rp_rol     FOREIGN KEY (rol_id)     REFERENCES roles (id)    ON DELETE CASCADE,
+    CONSTRAINT fk_rp_permiso FOREIGN KEY (permiso_id) REFERENCES permisos (id) ON DELETE CASCADE
 ) ENGINE = InnoDB;
 
 -- Usuarios de la APLICACIÓN (no confundir con usuarios de MySQL).
@@ -185,15 +206,37 @@ CREATE TABLE producto_proveedor (
 ) ENGINE = InnoDB;
 
 -- cliente_id NULL en ventas = "consumidor final".
+-- cupo_fiado = cuánto puede deber como máximo (0 = no se le fía).
 CREATE TABLE clientes (
     id                INT AUTO_INCREMENT PRIMARY KEY,
     tipo_documento    ENUM('CC','CE','NIT','PAS','TI') NOT NULL,
-    numero_documento  VARCHAR(20)  NOT NULL,
-    nombre            VARCHAR(150) NOT NULL,
-    email             VARCHAR(120) NULL,
-    telefono          VARCHAR(20)  NULL,
-    creado_en         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_cliente_documento UNIQUE (tipo_documento, numero_documento)
+    numero_documento  VARCHAR(20)   NOT NULL,
+    nombre            VARCHAR(150)  NOT NULL,
+    email             VARCHAR(120)  NULL,
+    telefono          VARCHAR(20)   NULL,
+    cupo_fiado        DECIMAL(14,2) NOT NULL DEFAULT 0,
+    activo            BOOLEAN       NOT NULL DEFAULT TRUE,
+    creado_en         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_cliente_documento UNIQUE (tipo_documento, numero_documento),
+    CONSTRAINT chk_cliente_cupo CHECK (cupo_fiado >= 0)
+) ENGINE = InnoDB;
+
+-- Pagos que hace el cliente para bajar lo que debe.
+-- Lo que debe NO se guarda: se calcula (ver v_saldo_clientes).
+--   deuda = pagos con metodo 'FIADO' de ventas no anuladas − abonos
+CREATE TABLE abonos_clientes (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    cliente_id  INT           NOT NULL,
+    monto       DECIMAL(14,2) NOT NULL,
+    metodo      ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
+                     'TRANSFERENCIA','NEQUI','DAVIPLATA') NOT NULL,
+    usuario_id  INT           NOT NULL,          -- quién recibió el abono
+    nota        VARCHAR(255)  NULL,
+    creado_en   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_abono_cliente FOREIGN KEY (cliente_id) REFERENCES clientes (id),
+    CONSTRAINT fk_abono_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
+    CONSTRAINT chk_abono_monto CHECK (monto > 0),
+    INDEX idx_abono_cliente_fecha (cliente_id, creado_en)
 ) ENGINE = InnoDB;
 
 -- =====================================================================
@@ -299,7 +342,7 @@ CREATE TABLE ventas (
     cliente_id       INT           NULL,              -- NULL = consumidor final
     usuario_id       INT           NOT NULL,          -- cajero
     fecha            DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    estado           ENUM('PAGADA','ANULADA') NOT NULL DEFAULT 'PAGADA',
+    estado           ENUM('COMPLETADA','ANULADA') NOT NULL DEFAULT 'COMPLETADA',
     subtotal         DECIMAL(14,2) NOT NULL,
     total_impuestos  DECIMAL(14,2) NOT NULL,
     total            DECIMAL(14,2) NOT NULL,
@@ -333,11 +376,13 @@ ALTER TABLE movimientos_inventario
     ADD CONSTRAINT fk_mov_venta FOREIGN KEY (venta_detalle_id) REFERENCES venta_detalles (id);
 
 -- Una venta puede pagarse con varios medios (parte efectivo, parte Nequi).
+-- 'FIADO' = la parte que el cliente queda debiendo. El servicio Java valida que
+-- la venta tenga cliente y que no supere su cupo (cruza tablas: no cabe en un CHECK).
 CREATE TABLE venta_pagos (
     id        INT AUTO_INCREMENT PRIMARY KEY,
     venta_id  INT           NOT NULL,
     metodo    ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
-                   'TRANSFERENCIA','NEQUI','DAVIPLATA') NOT NULL,
+                   'TRANSFERENCIA','NEQUI','DAVIPLATA','FIADO') NOT NULL,
     monto     DECIMAL(14,2) NOT NULL,
     CONSTRAINT fk_pago_venta FOREIGN KEY (venta_id) REFERENCES ventas (id),
     CONSTRAINT chk_pago_monto CHECK (monto > 0)
@@ -391,6 +436,31 @@ FROM movimientos_inventario m
 JOIN lotes     l ON l.id = m.lote_id
 JOIN productos p ON p.id = l.producto_id
 JOIN usuarios  u ON u.id = m.usuario_id;
+
+-- Deuda de cada cliente con fiado y cuánto cupo le queda.
+CREATE VIEW v_saldo_clientes AS
+SELECT c.id,
+       c.nombre,
+       c.cupo_fiado,
+       COALESCE(f.total_fiado, 0) - COALESCE(a.total_abonos, 0)                AS deuda,
+       c.cupo_fiado - (COALESCE(f.total_fiado, 0) - COALESCE(a.total_abonos, 0)) AS cupo_disponible
+FROM clientes c
+LEFT JOIN (SELECT v.cliente_id, SUM(p.monto) AS total_fiado
+           FROM ventas v JOIN venta_pagos p ON p.venta_id = v.id
+           WHERE p.metodo = 'FIADO' AND v.estado <> 'ANULADA'
+           GROUP BY v.cliente_id) f ON f.cliente_id = c.id
+LEFT JOIN (SELECT cliente_id, SUM(monto) AS total_abonos
+           FROM abonos_clientes GROUP BY cliente_id) a ON a.cliente_id = c.id
+WHERE c.cupo_fiado > 0 OR f.total_fiado IS NOT NULL;
+
+-- Permisos efectivos de cada usuario (lo que consulta el login).
+CREATE VIEW v_permisos_usuario AS
+SELECT u.id AS usuario_id, u.username, r.nombre AS rol, p.codigo AS permiso
+FROM usuarios u
+JOIN roles r         ON r.id = u.rol_id
+JOIN rol_permisos rp ON rp.rol_id = r.id
+JOIN permisos p      ON p.id = rp.permiso_id
+WHERE u.activo;
 
 -- Valor del inventario al costo (lo que costó) y al precio de venta (lo que vale).
 CREATE VIEW v_valor_inventario AS
