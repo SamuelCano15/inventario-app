@@ -11,7 +11,8 @@
 --   4. Compras       → compras, compra_detalles, pagos_proveedores
 --   5. Inventario    → lotes, conteos_inventario, conteo_detalles,
 --                      movimientos_inventario (kardex)
---   6. Ventas        → ventas, venta_detalles, venta_pagos
+--   6. Ventas        → turnos_caja, ventas, venta_detalles, venta_pagos,
+--                      devoluciones, devolucion_detalles
 --   7. Utilidades    → consecutivos, vistas
 -- =====================================================================
 
@@ -232,6 +233,7 @@ CREATE TABLE abonos_clientes (
     metodo      ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
                      'TRANSFERENCIA','NEQUI','DAVIPLATA') NOT NULL,
     usuario_id  INT           NOT NULL,          -- quién recibió el abono
+    turno_id    INT           NULL,              -- turno de caja (fk se agrega en el módulo 6)
     nota        VARCHAR(255)  NULL,
     creado_en   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_abono_cliente FOREIGN KEY (cliente_id) REFERENCES clientes (id),
@@ -425,40 +427,89 @@ CREATE TABLE movimientos_inventario (
 -- 6. VENTAS
 -- =====================================================================
 
+-- Turno de caja: el cajero abre con una base en efectivo y al cerrar cuenta lo que hay.
+-- v_cuadre_turnos calcula cuánto DEBERÍA haber; la diferencia es faltante o sobrante.
+CREATE TABLE turnos_caja (
+    id                INT AUTO_INCREMENT PRIMARY KEY,
+    usuario_id        INT           NOT NULL,          -- cajero
+    estado            ENUM('ABIERTO','CERRADO') NOT NULL DEFAULT 'ABIERTO',
+    base_inicial      DECIMAL(14,2) NOT NULL,          -- efectivo con que arranca
+    efectivo_contado  DECIMAL(14,2) NULL,              -- lo que contó al cerrar
+    abierto_en        DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    cerrado_en        DATETIME      NULL,
+    notas             VARCHAR(255)  NULL,
+    CONSTRAINT fk_turno_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
+    CONSTRAINT chk_turno_base   CHECK (base_inicial >= 0),
+    CONSTRAINT chk_turno_estado CHECK (
+        (estado = 'ABIERTO' AND cerrado_en IS NULL     AND efectivo_contado IS NULL)
+     OR (estado = 'CERRADO' AND cerrado_en IS NOT NULL
+                            AND efectivo_contado IS NOT NULL AND efectivo_contado >= 0)
+    ),
+    INDEX idx_turno_usuario_estado (usuario_id, estado)
+) ENGINE = InnoDB;
+
+ALTER TABLE abonos_clientes
+    ADD CONSTRAINT fk_abono_turno FOREIGN KEY (turno_id) REFERENCES turnos_caja (id);
+
+-- Una venta nunca se borra ni se edita: se ANULA (y el producto vuelve a sus lotes
+-- con movimientos ANULACION_VENTA). Para devolver solo una parte → devoluciones.
 CREATE TABLE ventas (
-    id               INT AUTO_INCREMENT PRIMARY KEY,
-    numero_factura   VARCHAR(20)   NOT NULL,          -- de consecutivos 'FACTURA-VENTA'
-    cliente_id       INT           NULL,              -- NULL = consumidor final
-    usuario_id       INT           NOT NULL,          -- cajero
-    fecha            DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    estado           ENUM('COMPLETADA','ANULADA') NOT NULL DEFAULT 'COMPLETADA',
-    subtotal         DECIMAL(14,2) NOT NULL,
-    total_impuestos  DECIMAL(14,2) NOT NULL,
-    total            DECIMAL(14,2) NOT NULL,
-    CONSTRAINT uq_venta_factura UNIQUE (numero_factura),
-    CONSTRAINT fk_venta_cliente FOREIGN KEY (cliente_id) REFERENCES clientes (id),
-    CONSTRAINT fk_venta_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
-    CONSTRAINT chk_venta_totales CHECK (subtotal >= 0 AND total_impuestos >= 0
-                                        AND total = subtotal + total_impuestos),
+    id                INT AUTO_INCREMENT PRIMARY KEY,
+    numero_factura    VARCHAR(20)   NOT NULL,          -- de consecutivos 'FACTURA-VENTA'
+    cliente_id        INT           NULL,              -- NULL = consumidor final
+    usuario_id        INT           NOT NULL,          -- cajero
+    turno_id          INT           NOT NULL,
+    fecha             DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    estado            ENUM('COMPLETADA','ANULADA') NOT NULL DEFAULT 'COMPLETADA',
+    -- totales = suma de las líneas (los calcula el servicio en la misma transacción)
+    subtotal          DECIMAL(14,2) NOT NULL,          -- base gravable (sin IVA)
+    total_impuestos   DECIMAL(14,2) NOT NULL,
+    total             DECIMAL(14,2) NOT NULL,          -- lo que paga el cliente
+    anulada_en        DATETIME      NULL,
+    anulada_por       INT           NULL,
+    motivo_anulacion  VARCHAR(255)  NULL,
+    CONSTRAINT uq_venta_factura   UNIQUE (numero_factura),
+    CONSTRAINT fk_venta_cliente   FOREIGN KEY (cliente_id)  REFERENCES clientes (id),
+    CONSTRAINT fk_venta_usuario   FOREIGN KEY (usuario_id)  REFERENCES usuarios (id),
+    CONSTRAINT fk_venta_turno     FOREIGN KEY (turno_id)    REFERENCES turnos_caja (id),
+    CONSTRAINT fk_venta_anulador  FOREIGN KEY (anulada_por) REFERENCES usuarios (id),
+    CONSTRAINT chk_venta_totales  CHECK (subtotal >= 0 AND total_impuestos >= 0
+                                         AND total = subtotal + total_impuestos),
+    -- anulada ⇔ sabemos cuándo, quién y por qué
+    CONSTRAINT chk_venta_anulacion CHECK (
+        (estado = 'COMPLETADA' AND anulada_en IS NULL AND anulada_por IS NULL AND motivo_anulacion IS NULL)
+     OR (estado = 'ANULADA' AND anulada_en IS NOT NULL AND anulada_por IS NOT NULL AND motivo_anulacion IS NOT NULL)
+    ),
     INDEX idx_venta_fecha (fecha)
 ) ENGINE = InnoDB;
 
 -- Precio e impuesto se COPIAN: si mañana sube la leche, la factura de hoy no cambia.
+-- El precio viene CON IVA (como en la estantería). Base e IVA se calculan POR LÍNEA:
+--   total_linea = cantidad × precio − descuento               (lo que paga el cliente)
+--   base_linea  = ROUND(total_linea / (1 + %IVA/100), 2)      (se redondea una sola vez)
+--   iva_linea   = total_linea − base_linea                    (por diferencia: SIEMPRE cuadra)
+-- Ej.: 3 leches a 4.500 con IVA 19 % → total 13.500, base 11.344,54, IVA 2.155,46.
 CREATE TABLE venta_detalles (
-    id                   INT AUTO_INCREMENT PRIMARY KEY,
-    venta_id             INT           NOT NULL,
-    producto_id          INT           NOT NULL,
-    cantidad             INT           NOT NULL,
-    precio_unitario      DECIMAL(12,2) NOT NULL,     -- snapshot, sin IVA
-    porcentaje_impuesto  DECIMAL(5,2)  NOT NULL,     -- snapshot
-    descuento            DECIMAL(12,2) NOT NULL DEFAULT 0,
-    subtotal_linea       DECIMAL(14,2) GENERATED ALWAYS AS
-                         (cantidad * precio_unitario - descuento) STORED,
+    id                          INT AUTO_INCREMENT PRIMARY KEY,
+    venta_id                    INT           NOT NULL,
+    producto_id                 INT           NOT NULL,
+    cantidad                    INT           NOT NULL,
+    precio_unitario_iva_incluido DECIMAL(12,2) NOT NULL,   -- snapshot
+    porcentaje_impuesto         DECIMAL(5,2)  NOT NULL,    -- snapshot
+    descuento_iva_incluido      DECIMAL(12,2) NOT NULL DEFAULT 0,
+    total_linea  DECIMAL(14,2) GENERATED ALWAYS AS
+                 (cantidad * precio_unitario_iva_incluido - descuento_iva_incluido) STORED,
+    base_linea   DECIMAL(14,2) GENERATED ALWAYS AS
+                 (ROUND((cantidad * precio_unitario_iva_incluido - descuento_iva_incluido)
+                        / (1 + porcentaje_impuesto / 100), 2)) STORED,
+    iva_linea    DECIMAL(14,2) GENERATED ALWAYS AS (total_linea - base_linea) STORED,
     CONSTRAINT fk_vd_venta    FOREIGN KEY (venta_id)    REFERENCES ventas (id),
     CONSTRAINT fk_vd_producto FOREIGN KEY (producto_id) REFERENCES productos (id),
     CONSTRAINT chk_vd_cantidad  CHECK (cantidad > 0),
-    CONSTRAINT chk_vd_precio    CHECK (precio_unitario >= 0),
-    CONSTRAINT chk_vd_descuento CHECK (descuento >= 0 AND descuento <= cantidad * precio_unitario)
+    CONSTRAINT chk_vd_precio    CHECK (precio_unitario_iva_incluido >= 0),
+    CONSTRAINT chk_vd_impuesto  CHECK (porcentaje_impuesto BETWEEN 0 AND 100),
+    CONSTRAINT chk_vd_descuento CHECK (descuento_iva_incluido >= 0
+                                       AND descuento_iva_incluido <= cantidad * precio_unitario_iva_incluido)
 ) ENGINE = InnoDB;
 
 ALTER TABLE movimientos_inventario
@@ -466,15 +517,55 @@ ALTER TABLE movimientos_inventario
 
 -- Una venta puede pagarse con varios medios (parte efectivo, parte Nequi).
 -- 'FIADO' = la parte que el cliente queda debiendo. El servicio Java valida que
--- la venta tenga cliente y que no supere su cupo (cruza tablas: no cabe en un CHECK).
+-- la venta tenga cliente, que no supere su cupo y que los pagos sumen el total
+-- (cruzan filas o tablas: no caben en un CHECK).
+-- En efectivo se guarda lo que entregó el cliente para calcular el cambio.
 CREATE TABLE venta_pagos (
-    id        INT AUTO_INCREMENT PRIMARY KEY,
-    venta_id  INT           NOT NULL,
-    metodo    ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
-                   'TRANSFERENCIA','NEQUI','DAVIPLATA','FIADO') NOT NULL,
-    monto     DECIMAL(14,2) NOT NULL,
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    venta_id        INT           NOT NULL,
+    metodo          ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
+                         'TRANSFERENCIA','NEQUI','DAVIPLATA','FIADO') NOT NULL,
+    monto           DECIMAL(14,2) NOT NULL,            -- lo que se aplica a la venta
+    monto_recibido  DECIMAL(14,2) NULL,                -- solo efectivo: el billete que entregó
+    cambio          DECIMAL(14,2) GENERATED ALWAYS AS (monto_recibido - monto) STORED,
+    referencia      VARCHAR(60)   NULL,                -- voucher, número de transferencia...
     CONSTRAINT fk_pago_venta FOREIGN KEY (venta_id) REFERENCES ventas (id),
-    CONSTRAINT chk_pago_monto CHECK (monto > 0)
+    CONSTRAINT chk_pago_monto CHECK (monto > 0),
+    CONSTRAINT chk_pago_efectivo CHECK (
+        -- ojo: sin el IS NOT NULL, un NULL haría el CHECK "desconocido" y MySQL lo dejaría pasar
+        (metodo = 'EFECTIVO' AND monto_recibido IS NOT NULL AND monto_recibido >= monto)
+     OR (metodo <> 'EFECTIVO' AND monto_recibido IS NULL)
+    )
+) ENGINE = InnoDB;
+
+-- Devolución parcial: el cliente trae 1 de las 3 leches.
+-- El producto vuelve AL MISMO LOTE del que salió: se buscan los movimientos
+-- SALIDA_VENTA de ese venta_detalle_id (por eso el kardex guarda esa referencia).
+CREATE TABLE devoluciones (
+    id                 INT AUTO_INCREMENT PRIMARY KEY,
+    venta_id           INT           NOT NULL,
+    usuario_id         INT           NOT NULL,
+    turno_id           INT           NOT NULL,
+    motivo             VARCHAR(255)  NOT NULL,
+    metodo_reembolso   ENUM('EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO',
+                            'TRANSFERENCIA','NEQUI','DAVIPLATA','FIADO') NOT NULL,  -- FIADO = se resta de la deuda
+    total_reembolsado  DECIMAL(14,2) NOT NULL,
+    creado_en          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_dev_venta   FOREIGN KEY (venta_id)   REFERENCES ventas (id),
+    CONSTRAINT fk_dev_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
+    CONSTRAINT fk_dev_turno   FOREIGN KEY (turno_id)   REFERENCES turnos_caja (id),
+    CONSTRAINT chk_dev_total  CHECK (total_reembolsado >= 0)
+) ENGINE = InnoDB;
+
+-- El servicio valida que no se devuelva más de lo vendido (sumando devoluciones previas).
+CREATE TABLE devolucion_detalles (
+    devolucion_id     INT NOT NULL,
+    venta_detalle_id  INT NOT NULL,
+    cantidad          INT NOT NULL,
+    PRIMARY KEY (devolucion_id, venta_detalle_id),
+    CONSTRAINT fk_dd_devolucion    FOREIGN KEY (devolucion_id)    REFERENCES devoluciones (id) ON DELETE CASCADE,
+    CONSTRAINT fk_dd_venta_detalle FOREIGN KEY (venta_detalle_id) REFERENCES venta_detalles (id),
+    CONSTRAINT chk_dd_cantidad CHECK (cantidad > 0)
 ) ENGINE = InnoDB;
 
 -- =====================================================================
@@ -539,7 +630,12 @@ LEFT JOIN (SELECT v.cliente_id, SUM(p.monto) AS total_fiado
            WHERE p.metodo = 'FIADO' AND v.estado <> 'ANULADA'
            GROUP BY v.cliente_id) f ON f.cliente_id = c.id
 LEFT JOIN (SELECT cliente_id, SUM(monto) AS total_abonos
-           FROM abonos_clientes GROUP BY cliente_id) a ON a.cliente_id = c.id
+           FROM (SELECT cliente_id, monto FROM abonos_clientes
+                 UNION ALL                       -- una devolución de algo fiado baja la deuda
+                 SELECT v.cliente_id, d.total_reembolsado
+                 FROM devoluciones d JOIN ventas v ON v.id = d.venta_id
+                 WHERE d.metodo_reembolso = 'FIADO') x
+           GROUP BY cliente_id) a ON a.cliente_id = c.id
 WHERE c.cupo_fiado > 0 OR f.total_fiado IS NOT NULL;
 
 -- Permisos efectivos de cada usuario (lo que consulta el login).
@@ -586,10 +682,67 @@ WHERE m.tipo IN ('BAJA_VENCIMIENTO', 'AJUSTE_SALIDA')
   AND reversa.id IS NULL                  -- y nadie lo reversó
 GROUP BY p.sku, p.nombre;
 
+-- Ventas por día (solo completadas).
+CREATE VIEW v_ventas_por_dia AS
+SELECT DATE(fecha)          AS dia,
+       COUNT(*)             AS numero_ventas,
+       SUM(subtotal)        AS base,
+       SUM(total_impuestos) AS iva,
+       SUM(total)           AS total
+FROM ventas
+WHERE estado = 'COMPLETADA'
+GROUP BY DATE(fecha);
+
+-- Ganancia por producto: lo cobrado (sin IVA) menos el costo REAL de los lotes de donde salió.
+-- El costo se toma del kardex: cada SALIDA_VENTA dice de qué lote salió.
+CREATE VIEW v_ganancia_productos AS
+SELECT p.sku,
+       p.nombre,
+       SUM(vd.cantidad)                                  AS unidades_vendidas,
+       SUM(vd.base_linea)                                AS ingreso_sin_iva,
+       SUM(c.costo)                                      AS costo,
+       SUM(vd.base_linea) - SUM(c.costo)                 AS ganancia,
+       ROUND(100 * (SUM(vd.base_linea) - SUM(c.costo)) / NULLIF(SUM(vd.base_linea), 0), 1) AS margen_pct
+FROM venta_detalles vd
+JOIN ventas v    ON v.id = vd.venta_id AND v.estado = 'COMPLETADA'
+JOIN productos p ON p.id = vd.producto_id
+JOIN (SELECT m.venta_detalle_id, SUM(m.cantidad * l.costo_unitario_sin_iva) AS costo
+      FROM movimientos_inventario m JOIN lotes l ON l.id = m.lote_id
+      WHERE m.tipo = 'SALIDA_VENTA'
+      GROUP BY m.venta_detalle_id) c ON c.venta_detalle_id = vd.id
+GROUP BY p.sku, p.nombre;
+
+-- Cuadre de caja: efectivo esperado = base + ventas en efectivo + abonos en efectivo
+-- − reembolsos en efectivo. Se compara con lo contado al cerrar.
+CREATE VIEW v_cuadre_turnos AS
+SELECT t.id AS turno_id,
+       u.username,
+       t.estado,
+       t.base_inicial,
+       COALESCE(ve.total, 0) AS ventas_efectivo,
+       COALESCE(ab.total, 0) AS abonos_efectivo,
+       COALESCE(de.total, 0) AS reembolsos_efectivo,
+       t.base_inicial + COALESCE(ve.total, 0) + COALESCE(ab.total, 0) - COALESCE(de.total, 0) AS efectivo_esperado,
+       t.efectivo_contado,
+       t.efectivo_contado
+         - (t.base_inicial + COALESCE(ve.total, 0) + COALESCE(ab.total, 0) - COALESCE(de.total, 0)) AS diferencia
+FROM turnos_caja t
+JOIN usuarios u ON u.id = t.usuario_id
+LEFT JOIN (SELECT v.turno_id, SUM(p.monto) AS total
+           FROM ventas v JOIN venta_pagos p ON p.venta_id = v.id
+           WHERE v.estado = 'COMPLETADA' AND p.metodo = 'EFECTIVO'
+           GROUP BY v.turno_id) ve ON ve.turno_id = t.id
+LEFT JOIN (SELECT turno_id, SUM(monto) AS total
+           FROM abonos_clientes WHERE metodo = 'EFECTIVO'
+           GROUP BY turno_id) ab ON ab.turno_id = t.id
+LEFT JOIN (SELECT turno_id, SUM(total_reembolsado) AS total
+           FROM devoluciones WHERE metodo_reembolso = 'EFECTIVO'
+           GROUP BY turno_id) de ON de.turno_id = t.id;
+
 -- Valor del inventario al costo (lo que costó) y al precio de venta (lo que vale).
 CREATE VIEW v_valor_inventario AS
 SELECT SUM(l.cantidad_actual * l.costo_unitario_sin_iva) AS valor_al_costo,
-       SUM(l.cantidad_actual * p.precio_venta_iva_incluido) AS valor_a_precio_venta
+       SUM(l.cantidad_actual * p.precio_venta_iva_incluido) AS valor_a_precio_venta  -- con IVA
 FROM lotes l
 JOIN productos p ON p.id = l.producto_id
 WHERE l.fecha_vencimiento IS NULL OR l.fecha_vencimiento >= CURRENT_DATE;
